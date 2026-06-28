@@ -1,0 +1,564 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  PCO Abandoned Cart - Event Processing Pipeline v2.
+  Creates all AWS resources: SQS queues, DynamoDB tables,
+  Lambda functions, API Gateway HTTP API, EventBridge Scheduler,
+  and IAM roles. JourneyRouter and SendMessage require full
+  code to be pasted manually after deployment.
+
+Parameters:
+
+  Environment:
+    Type: String
+    Default: sandbox-v2
+    AllowedValues: [sandbox, sandbox-v2, staging, production]
+    Description: Deployment environment — appended to all resource names
+
+  FromEmail:
+    Type: String
+    Default: your-email@example.com
+    Description: SES verified sender email address
+
+  AggregatorBatchWindowSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 0
+    MaxValue: 300
+    Description: Batch window for EventAggregator in seconds (60 for testing, 300 for production)
+
+  SchedulerRateMinutes:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: How often SendMessage Lambda fires in minutes (2 for testing, 5 for production)
+
+  AllowedCorsOrigin:
+    Type: String
+    Default: '*'
+    Description: CORS allowed origin — use * for sandbox, exact domain for production
+
+Resources:
+
+  # ── SQS QUEUES ────────────────────────────────────────────────────────────
+
+  RawEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub RawEvents-${Environment}
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 86400
+      Tags:
+        - Key: Project
+          Value: PCO-AbandonedCart
+        - Key: Environment
+          Value: !Ref Environment
+
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ProcessingQueue-${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 86400
+      Tags:
+        - Key: Project
+          Value: PCO-AbandonedCart
+        - Key: Environment
+          Value: !Ref Environment
+
+  FollowupQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub FollowupQueue-${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 86400
+      Tags:
+        - Key: Project
+          Value: PCO-AbandonedCart
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── DYNAMODB TABLES ───────────────────────────────────────────────────────
+
+  UserJourneyStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub UserJourneyState-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: cartId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: cartId
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttlExpiry
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: PCO-AbandonedCart
+        - Key: Environment
+          Value: !Ref Environment
+
+  UserDailyCapTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub UserDailyCap-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: emailDate
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: emailDate
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttlExpiry
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: PCO-AbandonedCart
+        - Key: Environment
+          Value: !Ref Environment
+
+  JourneyConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub JourneyConfig-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: journeyId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: journeyId
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: PCO-AbandonedCart
+        - Key: Environment
+          Value: !Ref Environment
+
+  UserPurchaseHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub UserPurchaseHistory-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: purchasedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: purchasedAt
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttlExpiry
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: PCO-AbandonedCart
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── IAM ROLES ─────────────────────────────────────────────────────────────
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub PCO-LambdaRole-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub PCO-LambdaPolicy-${Environment}
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource:
+                  - !GetAtt RawEventsQueue.Arn
+                  - !GetAtt ProcessingQueue.Arn
+                  - !GetAtt FollowupQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt UserJourneyStateTable.Arn
+                  - !GetAtt UserDailyCapTable.Arn
+                  - !GetAtt JourneyConfigTable.Arn
+                  - !GetAtt UserPurchaseHistoryTable.Arn
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub PCO-SchedulerRole-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub PCO-SchedulerPolicy-${Environment}
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt SendMessageLambda.Arn
+
+  # ── LAMBDA FUNCTIONS ──────────────────────────────────────────────────────
+
+  EventIntakeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub EventIntake-${Environment}
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          RAW_EVENTS_QUEUE_URL: !Ref RawEventsQueue
+      Code:
+        ZipFile: |
+          import json, boto3, os, logging, hashlib
+          from datetime import datetime, timezone
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          sqs = boto3.client('sqs')
+          RAW_EVENTS_URL = os.environ['RAW_EVENTS_QUEUE_URL']
+          VALID_EVENT_TYPES = {
+              'page_view','add_to_cart','remove_from_cart','view_cart',
+              'checkout','purchase','consent_given','consent_revoked'
+          }
+          CART_REQUIRED_FIELDS = {'cartId','cartConsent','dealerCode'}
+          CART_EVENT_TYPES = {
+              'add_to_cart','remove_from_cart','view_cart','checkout',
+              'purchase','consent_given','consent_revoked'
+          }
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event.get('body','{}'))
+              except json.JSONDecodeError:
+                  return _resp(400,'Invalid JSON body')
+              event_type = body.get('eventType') or body.get('name')
+              if not event_type or event_type not in VALID_EVENT_TYPES:
+                  return _resp(400,'Invalid or missing eventType')
+              if not body.get('userId'):
+                  return _resp(400,'Missing userId')
+              body['eventType'] = event_type
+              if event_type in CART_EVENT_TYPES:
+                  missing = CART_REQUIRED_FIELDS - set(body.keys())
+                  if missing:
+                      return _resp(400,f'Missing fields: {missing}')
+              now = datetime.now(timezone.utc).isoformat()
+              body['receivedAt'] = now
+              client_ts = body.get('eventTimestamp') or body.get('timestamp')
+              if client_ts:
+                  body['clientEventTimestamp'] = client_ts
+              body['eventTimestamp'] = now
+              consent = body.get('cartConsent') or body.get('consentCart','unknown')
+              body['cartConsent'] = consent
+              sqs.send_message(QueueUrl=RAW_EVENTS_URL, MessageBody=json.dumps(body))
+              logger.info(f"Queued {event_type} for user {body['userId']} serverTime={now} clientTime={body.get('clientEventTimestamp','none')}")
+              return _resp(200,'Event received')
+          def _resp(code, msg):
+              return {'statusCode':code,'headers':{'Content-Type':'application/json'},'body':json.dumps({'message':msg})}
+      Tags:
+        - Key: Project
+          Value: PCO-AbandonedCart
+        - Key: Environment
+          Value: !Ref Environment
+
+  EventAggregatorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub EventAggregator-${Environment}
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          PROCESSING_QUEUE_URL: !Ref ProcessingQueue
+      Code:
+        ZipFile: |
+          import json, boto3, os, logging, hashlib
+          from collections import defaultdict
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          sqs = boto3.client('sqs')
+          PROCESSING_QUEUE_URL = os.environ['PROCESSING_QUEUE_URL']
+          def lambda_handler(event, context):
+              grouped = defaultdict(list)
+              for record in event['Records']:
+                  try:
+                      body = json.loads(record['body'])
+                      user_id = body.get('userId')
+                      cart_id = body.get('cartId','no_cart')
+                      if not user_id:
+                          continue
+                      grouped[f"{user_id}#{cart_id}"].append(body)
+                  except Exception as e:
+                      logger.error(f"Failed to parse record: {e}")
+              logger.info(f"Aggregated {len(event['Records'])} events into {len(grouped)} user+cart groups")
+              for group_key, events in grouped.items():
+                  user_id, cart_id = group_key.split('#',1)
+                  events_sorted = sorted(events, key=lambda e: e.get('eventTimestamp', e.get('receivedAt','')))
+                  message = {
+                      'userId': user_id,
+                      'cartId': cart_id,
+                      'eventCount': len(events_sorted),
+                      'events': events_sorted,
+                      'windowClosedAt': events_sorted[-1].get('receivedAt','')
+                  }
+                  dedup_id = hashlib.md5(f"{group_key}#{message['windowClosedAt']}".encode()).hexdigest()
+                  sqs.send_message(
+                      QueueUrl=PROCESSING_QUEUE_URL,
+                      MessageBody=json.dumps(message),
+                      MessageGroupId=user_id,
+                      MessageDeduplicationId=dedup_id
+                  )
+              return {'statusCode': 200}
+      Tags:
+        - Key: Project
+          Value: PCO-AbandonedCart
+        - Key: Environment
+          Value: !Ref Environment
+
+  EventAggregatorTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt RawEventsQueue.Arn
+      FunctionName: !GetAtt EventAggregatorLambda.Arn
+      BatchSize: 100
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      MaximumBatchingWindowInSeconds: !Ref AggregatorBatchWindowSeconds
+
+  JourneyRouterLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub JourneyRouter-${Environment}
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_TABLE_NAME: !Sub UserJourneyState-${Environment}
+          DAILY_CAP_TABLE_NAME: !Sub UserDailyCap-${Environment}
+          CONFIG_TABLE_NAME: !Sub JourneyConfig-${Environment}
+          PURCHASE_TABLE_NAME: !Sub UserPurchaseHistory-${Environment}
+          FOLLOWUP_QUEUE_URL: !Ref FollowupQueue
+      Code:
+        ZipFile: |
+          # PLACEHOLDER — paste full JourneyRouter code after deployment
+          import logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          def lambda_handler(event, context):
+              logger.info("JourneyRouter placeholder — paste full code and redeploy")
+              return {'statusCode': 200}
+      Tags:
+        - Key: Project
+          Value: PCO-AbandonedCart
+        - Key: Environment
+          Value: !Ref Environment
+
+  JourneyRouterTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ProcessingQueue.Arn
+      FunctionName: !GetAtt JourneyRouterLambda.Arn
+      BatchSize: 10
+
+  SendMessageLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub SendMessage-${Environment}
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_TABLE_NAME: !Sub UserJourneyState-${Environment}
+          DAILY_CAP_TABLE_NAME: !Sub UserDailyCap-${Environment}
+          CONFIG_TABLE_NAME: !Sub JourneyConfig-${Environment}
+          FOLLOWUP_QUEUE_URL: !Ref FollowupQueue
+          FROM_EMAIL: !Ref FromEmail
+      Code:
+        ZipFile: |
+          # PLACEHOLDER — paste full SendMessage code after deployment
+          import logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          def lambda_handler(event, context):
+              logger.info("SendMessage placeholder — paste full code and redeploy")
+              return {'statusCode': 200}
+      Tags:
+        - Key: Project
+          Value: PCO-AbandonedCart
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── API GATEWAY ───────────────────────────────────────────────────────────
+
+  EventCollectorAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub EventCollectorAPI-${Environment}
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref AllowedCorsOrigin
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - x-api-key
+          - x-pco-token
+        MaxAge: 300
+      Tags:
+        Project: PCO-AbandonedCart
+        Environment: !Ref Environment
+
+  EventCollectorIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref EventCollectorAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub
+        - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+        - LambdaArn: !GetAtt EventIntakeLambda.Arn
+      PayloadFormatVersion: '2.0'
+
+  EventCollectorRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref EventCollectorAPI
+      RouteKey: POST /events
+      Target: !Sub integrations/${EventCollectorIntegration}
+
+  EventCollectorStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref EventCollectorAPI
+      StageName: prod
+      AutoDeploy: true
+
+  APIGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EventIntakeLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${EventCollectorAPI}/*/*
+
+  # ── EVENTBRIDGE SCHEDULER ─────────────────────────────────────────────────
+
+  FollowupScheduler:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub FollowupScheduler-${Environment}
+      ScheduleExpression: !Sub rate(${SchedulerRateMinutes} minutes)
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt SendMessageLambda.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+
+# ── OUTPUTS ───────────────────────────────────────────────────────────────────
+
+Outputs:
+
+  APIEndpoint:
+    Description: Full API Gateway invoke URL for POST /events
+    Value: !Sub https://${EventCollectorAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/events
+
+  RawEventsQueueURL:
+    Description: RawEvents SQS Standard queue URL
+    Value: !Ref RawEventsQueue
+
+  ProcessingQueueURL:
+    Description: ProcessingQueue FIFO URL
+    Value: !Ref ProcessingQueue
+
+  FollowupQueueURL:
+    Description: FollowupQueue FIFO URL
+    Value: !Ref FollowupQueue
+
+  UserJourneyStateTableName:
+    Description: DynamoDB UserJourneyState table name
+    Value: !Ref UserJourneyStateTable
+
+  JourneyConfigTableName:
+    Description: DynamoDB JourneyConfig table name
+    Value: !Ref JourneyConfigTable
+
+  UserDailyCapTableName:
+    Description: DynamoDB UserDailyCap table name
+    Value: !Ref UserDailyCapTable
+
+  UserPurchaseHistoryTableName:
+    Description: DynamoDB UserPurchaseHistory table name
+    Value: !Ref UserPurchaseHistoryTable
+
+  LambdaRoleARN:
+    Description: Shared Lambda execution role ARN
+    Value: !GetAtt LambdaExecutionRole.Arn
+
+  StackName:
+    Description: This CloudFormation stack name
+    Value: !Ref AWS::StackName
+
+  NextSteps:
+    Description: Manual steps required after deployment
+    Value: >
+      1. Paste full JourneyRouter code into JourneyRouter Lambda and deploy.
+      2. Paste full SendMessage code into SendMessage Lambda and deploy.
+      3. Seed JourneyConfig table with business rules record.
+      4. Verify TTL is enabled on UserJourneyState, UserDailyCap, UserPurchaseHistory tables.
+      5. Test with curl command using the APIEndpoint output above.
